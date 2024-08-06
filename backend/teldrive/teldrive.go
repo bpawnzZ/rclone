@@ -12,9 +12,9 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/rclone/rclone/backend/teldrive/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
@@ -26,12 +26,13 @@ import (
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
 	timeFormat       = time.RFC3339
 	maxChunkSize     = 2000 * fs.Mebi
-	defaultChunkSize = 1000 * fs.Mebi
+	defaultChunkSize = 500 * fs.Mebi
 	minChunkSize     = 500 * fs.Mebi
 )
 
@@ -53,9 +54,13 @@ func init() {
 			Name:    "chunk_size",
 			Default: defaultChunkSize,
 		}, {
-			Name:     "randomise_part",
+			Help:    "Page Size for listing files",
+			Name:    "page_size",
+			Default: 500,
+		}, {
+			Name:     "random_chunk_name",
 			Default:  true,
-			Help:     "Randomise part",
+			Help:     "Random Names For Chunks for Security",
 			Advanced: true,
 		}, {
 			Name:      "channel_id",
@@ -68,15 +73,26 @@ func init() {
 			Advanced: true,
 		},
 			{
+				Name:     "threaded_streams",
+				Default:  false,
+				Help:     "Thread Streams",
+				Advanced: true,
+			},
+			{
+				Help:      "Upload Api Host",
+				Name:      "upload_host",
+				Sensitive: true,
+			},
+			{
 				Name:    "encrypt_files",
 				Default: false,
-				Help:    "Enable Native  Teldrive Encryption",
+				Help:    "Enable Native Teldrive Encryption",
 			}, {
 
 				Name:     config.ConfigEncoding,
 				Help:     config.ConfigEncodingHelp,
 				Advanced: true,
-				Default:  encoder.Standard,
+				Default:  encoder.EncodeInvalidUtf8,
 			}},
 	})
 }
@@ -84,12 +100,15 @@ func init() {
 // Options defines the configuration for this backend
 type Options struct {
 	ApiHost           string               `config:"api_host"`
+	UploadHost        string               `config:"upload_host"`
 	AccessToken       string               `config:"access_token"`
 	ChunkSize         fs.SizeSuffix        `config:"chunk_size"`
-	RandomisePart     bool                 `config:"randomise_part"`
+	RandomChunkName   bool                 `config:"random_chunk_name"`
 	UploadConcurrency int                  `config:"upload_concurrency"`
 	ChannelID         int64                `config:"channel_id"`
 	EncryptFiles      bool                 `config:"encrypt_files"`
+	PageSize          int64                `config:"page_size"`
+	ThreadedStreams   bool                 `config:"threaded_streams"`
 	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -101,7 +120,7 @@ type Fs struct {
 	features *fs.Features
 	srv      *rest.Client
 	pacer    *fs.Pacer
-	authHash string
+	userId   int64
 }
 
 // Object represents an teldrive object
@@ -112,7 +131,8 @@ type Object struct {
 	size     int64
 	parentId string
 	name     string
-	modTime  string
+	modTime  time.Time
+	mimeType string
 }
 
 // Name of the remote (as passed into NewFs)
@@ -166,28 +186,16 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 
 // dirPath returns an escaped file path (f.root, file)
 func (f *Fs) dirPath(file string) string {
-	//return path.Join(f.diskRoot, file)
 	if file == "" || file == "." {
-		return "/" + f.root
+		return f.opt.Enc.FromStandardPath("/" + f.root)
 	}
-	return "/" + path.Join(f.root, file)
+	return f.opt.Enc.FromStandardPath("/" + strings.Trim(path.Join(f.root, file), "/"))
 }
 
 // returns the full path based on root and the last element
-func (f *Fs) splitPathFull(pth string) (string, string) {
-	fullPath := strings.Trim(path.Join(f.root, pth), "/")
-
-	i := len(fullPath) - 1
-	for i >= 0 && fullPath[i] != '/' {
-		i--
-	}
-
-	if i < 0 {
-		return "/" + fullPath[:i+1], fullPath[i+1:]
-	}
-
-	// do not include the / at the split
-	return "/" + fullPath[:i], fullPath[i+1:]
+func (f *Fs) splitPathFull(file string) (string, string) {
+	base, leaf := path.Split(f.opt.Enc.FromStandardPath("/" + strings.Trim(path.Join(f.root, file), "/")))
+	return "/" + strings.Trim(base, "/"), leaf
 }
 
 func checkUploadChunkSize(cs fs.SizeSuffix) error {
@@ -221,6 +229,11 @@ func NewFs(ctx context.Context, name string, root string, config configmap.Mappe
 		return nil, err
 	}
 
+	if opt.ChannelID < 0 {
+		channnelId := strconv.FormatInt(opt.ChannelID, 10)
+		opt.ChannelID, _ = strconv.ParseInt(strings.TrimPrefix(channnelId, "-100"), 10, 64)
+	}
+
 	f := &Fs{
 		name:  name,
 		root:  root,
@@ -236,7 +249,7 @@ func NewFs(ctx context.Context, name string, root string, config configmap.Mappe
 	f.features = (&fs.Features{
 		DuplicateFiles:          false,
 		CanHaveEmptyDirectories: true,
-		ReadMimeType:            false,
+		ReadMimeType:            true,
 		ChunkWriterDoesntSeek:   true,
 	}).Fill(ctx, f)
 
@@ -263,17 +276,13 @@ func NewFs(ctx context.Context, name string, root string, config configmap.Mappe
 		return nil, err
 	}
 
-	if session.Hash == "" {
-		return nil, fmt.Errorf("invalid session token")
-	}
-
 	for _, cookie := range sessionResp.Cookies() {
 		if cookie.Name == "user-session" && cookie.Value != "" {
 			config.Set("access_token", cookie.Value)
 		}
 	}
 
-	f.authHash = session.Hash
+	f.userId = session.UserId
 
 	dir, base := f.splitPathFull("")
 
@@ -284,7 +293,7 @@ func NewFs(ctx context.Context, name string, root string, config configmap.Mappe
 	}
 
 	if res != nil && len(res.Files) == 1 && res.Files[0].Type == "file" {
-		f.root = strings.Trim(dir, "/")
+		f.root = strings.Trim(path.Dir(f.root), "/")
 		return f, fs.ErrorIsFile
 	}
 
@@ -297,12 +306,11 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string, options *api.
 		Method: "GET",
 		Path:   "/api/files",
 		Parameters: url.Values{
-			"path":          []string{path},
-			"perPage":       []string{strconv.FormatUint(options.PerPage, 10)},
-			"sort":          []string{"name"},
-			"order":         []string{"asc"},
-			"op":            []string{"list"},
-			"nextPageToken": []string{options.NextPageToken},
+			"path":  []string{path},
+			"limit": []string{strconv.FormatInt(options.Limit, 10)},
+			"sort":  []string{"id"},
+			"op":    []string{"list"},
+			"page":  []string{strconv.FormatInt(options.Page, 10)},
 		},
 	}
 	var err error
@@ -320,30 +328,6 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string, options *api.
 		} else {
 			return nil, err
 		}
-	}
-
-	return &info, nil
-}
-
-func (f *Fs) getPathInfo(ctx context.Context, path string) (*api.ReadMetadataResponse, error) {
-
-	opts := rest.Opts{
-		Method: "GET",
-		Path:   "/api/files",
-		Parameters: url.Values{
-			"path": []string{path},
-			"op":   []string{"find"},
-		},
-	}
-	var err error
-	var info api.ReadMetadataResponse
-	var resp *http.Response
-	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
-		return shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
-		return nil, err
 	}
 
 	return &info, nil
@@ -389,44 +373,68 @@ func (f *Fs) findObject(ctx context.Context, path string, name string) (*api.Rea
 // This should return ErrDirNotFound if the directory isn't
 // found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+
 	root := f.dirPath(dir)
 
-	var limit uint64 = 500        // max number of objects per request - 100 seems to be the maximum the api accepts
-	var nextPageToken string = "" // for the next page of requests
+	opts := &api.MetadataRequestOptions{
+		Limit: f.opt.PageSize,
+		Page:  1,
+	}
 
-	for {
-		opts := &api.MetadataRequestOptions{
-			PerPage:       limit,
-			NextPageToken: nextPageToken,
+	files := []api.FileInfo{}
+
+	info, err := f.readMetaDataForPath(ctx, root, opts)
+
+	if err != nil {
+		return nil, err
+	}
+
+	files = append(files, info.Files...)
+
+	mu := sync.Mutex{}
+	if info.Meta.TotalPages > 1 {
+		g, _ := errgroup.WithContext(ctx)
+
+		g.SetLimit(8)
+
+		for i := 2; i <= info.Meta.TotalPages; i++ {
+			page := i
+			g.Go(func() error {
+				opts := &api.MetadataRequestOptions{
+					Limit: f.opt.PageSize,
+					Page:  int64(page),
+				}
+				info, err := f.readMetaDataForPath(ctx, root, opts)
+
+				if err != nil {
+					return err
+				}
+				mu.Lock()
+				files = append(files, info.Files...)
+				mu.Unlock()
+				return nil
+			})
 		}
-
-		info, err := f.readMetaDataForPath(ctx, root, opts)
-		if err != nil {
+		if err := g.Wait(); err != nil {
 			return nil, err
 		}
+	}
 
-		for _, item := range info.Files {
-			remote := path.Join(dir, f.opt.Enc.ToStandardName(item.Name))
-			if item.Type == "folder" {
-				modTime, _ := time.Parse(timeFormat, item.ModTime)
-				d := fs.NewDir(remote, modTime).SetID(item.Id).SetParentID(item.ParentId)
-				entries = append(entries, d)
+	for _, item := range files {
+		remote := path.Join(dir, f.opt.Enc.ToStandardName(item.Name))
+		if item.Type == "folder" {
+			modTime, _ := time.Parse(timeFormat, item.ModTime)
+			d := fs.NewDir(remote, modTime).SetID(item.Id).SetParentID(item.ParentId)
+			entries = append(entries, d)
+		}
+		if item.Type == "file" {
+			o, err := f.newObjectWithInfo(ctx, remote, &item)
+			if err != nil {
+				continue
 			}
-			if item.Type == "file" {
-				o, err := f.newObjectWithInfo(ctx, remote, &item)
-				if err != nil {
-					continue
-				}
-				entries = append(entries, o)
-			}
-
+			entries = append(entries, o)
 		}
 
-		nextPageToken = info.NextPageToken
-		//check if we reached end of list
-		if nextPageToken == "" {
-			break
-		}
 	}
 	return entries, nil
 }
@@ -434,7 +442,8 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 // Return an Object from a path
 //
 // If it can't be found it returns the error fs.ErrorObjectNotFound.
-func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *api.FileInfo) (fs.Object, error) {
+func (f *Fs) newObjectWithInfo(_ context.Context, remote string, info *api.FileInfo) (fs.Object, error) {
+	modTime, _ := time.Parse(timeFormat, info.ModTime)
 	o := &Object{
 		fs:       f,
 		remote:   remote,
@@ -442,7 +451,8 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *api.Fil
 		size:     info.Size,
 		parentId: info.ParentId,
 		name:     info.Name,
-		modTime:  info.ModTime,
+		modTime:  modTime,
+		mimeType: info.MimeType,
 	}
 	return o, nil
 }
@@ -456,8 +466,6 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	res, err := f.findObject(ctx, base, leaf)
 
 	if err != nil {
-		// need to change error type
-		// if the parent dir doesn't exist the object doesn't exist either
 		if err == fs.ErrorDirNotFound {
 			return nil, fs.ErrorObjectNotFound
 		}
@@ -480,7 +488,7 @@ func (f *Fs) move(ctx context.Context, dstPath string, fileID string) (err error
 
 	mv := api.MoveFileRequest{
 		Files:       []string{fileID},
-		Destination: dstPath,
+		Destination: f.opt.Enc.FromStandardPath(dstPath),
 	}
 
 	var resp *http.Response
@@ -514,158 +522,19 @@ func (f *Fs) updateFileInformation(ctx context.Context, update *api.UpdateFileIn
 	return err
 }
 
-func (f *Fs) putUnchecked(ctx context.Context, in0 io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.OpenOption) error {
 
-	base, leaf := f.splitPathFull(src.Remote())
-
-	modTime := src.ModTime(ctx).UTC().Format(timeFormat)
-
-	uploadID := getMD5Hash(fmt.Sprintf("%s:%d:%s", path.Join(base, leaf), src.Size(), modTime))
-
-	chunkSize := int64(f.opt.ChunkSize)
-
-	var existingParts map[int]api.PartFile
-
-	var uploadFile api.UploadFile
-
-	if chunkSize < src.Size() {
-		opts := rest.Opts{
-			Method: "GET",
-			Path:   "/api/uploads/" + uploadID,
-		}
-
-		err := f.pacer.Call(func() (bool, error) {
-			resp, err := f.srv.CallJSON(ctx, &opts, nil, &uploadFile)
-			return shouldRetry(ctx, resp, err)
-		})
-
-		if err == nil {
-			existingParts = make(map[int]api.PartFile, len(uploadFile.Parts))
-			for _, part := range uploadFile.Parts {
-				existingParts[part.PartNo] = part
-			}
-		}
+	o := &Object{
+		fs: f,
 	}
 
-	totalParts := src.Size() / chunkSize
+	uploadInfo, err := o.uploadMultipart(ctx, bufio.NewReader(in), src)
 
-	if src.Size()%chunkSize != 0 {
-		totalParts++
-	}
-
-	var partsToCommit []api.PartFile
-
-	var uploadedSize int64
-
-	in := bufio.NewReader(in0)
-
-	channelID := f.opt.ChannelID
-
-	encryptFile := f.opt.EncryptFiles
-
-	if len(uploadFile.Parts) > 0 {
-		channelID = uploadFile.Parts[0].ChannelID
-
-		encryptFile = uploadFile.Parts[0].Encrypted
-	}
-
-	partName := leaf
-
-	for partNo := 1; partNo <= int(totalParts); partNo++ {
-
-		if existing, ok := existingParts[partNo]; ok {
-			io.CopyN(io.Discard, in, existing.Size)
-			partsToCommit = append(partsToCommit, existing)
-			uploadedSize += existing.Size
-			continue
-		}
-
-		if partNo == int(totalParts) {
-			chunkSize = src.Size() - uploadedSize
-		}
-		partReader := io.LimitReader(in, chunkSize)
-
-		if f.opt.RandomisePart {
-			partName = getMD5Hash(uuid.New().String())
-		} else if totalParts > 1 {
-			partName = fmt.Sprintf("%s.part.%03d", leaf, partNo)
-		}
-
-		opts := rest.Opts{
-			Method:        "POST",
-			Path:          "/api/uploads/" + uploadID,
-			Body:          partReader,
-			ContentLength: &chunkSize,
-			Parameters: url.Values{
-				"partName":  []string{partName},
-				"fileName":  []string{leaf},
-				"partNo":    []string{strconv.Itoa(partNo)},
-				"channelId": []string{strconv.FormatInt(channelID, 10)},
-				"encrypted": []string{strconv.FormatBool(encryptFile)},
-			},
-		}
-
-		var info api.PartFile
-		err := f.pacer.Call(func() (bool, error) {
-			resp, err := f.srv.CallJSON(ctx, &opts, nil, &info)
-			return shouldRetry(ctx, resp, err)
-		})
-		if err != nil || info.PartId == 0 {
-			return fmt.Errorf("error sending chunk %d: %v", partNo, err)
-		}
-		uploadedSize += chunkSize
-
-		partsToCommit = append(partsToCommit, info)
-	}
-
-	if base != "/" {
-		err := f.CreateDir(ctx, base, "")
-		if err != nil {
-			return err
-		}
-	}
-
-	opts := rest.Opts{
-		Method: "POST",
-		Path:   "/api/files",
-	}
-
-	fileParts := []api.FilePart{}
-
-	for _, part := range partsToCommit {
-		fileParts = append(fileParts, api.FilePart{ID: part.PartId, Salt: part.Salt})
-	}
-
-	payload := api.CreateFileRequest{
-		Name:      leaf,
-		Type:      "file",
-		Path:      base,
-		MimeType:  fs.MimeType(ctx, src),
-		Size:      src.Size(),
-		Parts:     fileParts,
-		ChannelID: channelID,
-		Encrypted: encryptFile,
-	}
-	err := f.pacer.Call(func() (bool, error) {
-		resp, err := f.srv.CallJSON(ctx, &opts, &payload, nil)
-		return shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
-		return err
-	}
-	opts = rest.Opts{
-		Method: "DELETE",
-		Path:   "/api/uploads/" + uploadID,
-	}
-	err = f.pacer.Call(func() (bool, error) {
-		resp, err := f.srv.Call(ctx, &opts)
-		return shouldRetry(ctx, resp, err)
-	})
 	if err != nil {
 		return err
 	}
 
-	return nil
+	return o.createFile(ctx, src, uploadInfo)
 }
 
 // Put in to the remote path with the modTime given of the given size
@@ -708,31 +577,53 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 //
 // The new object may have been created if an error is returned
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+
 	if src.Size() < 0 {
 		return errors.New("refusing to update with unknown size")
 	}
 
-	// upload with new size but old name
-	//to change
-	err := o.fs.putUnchecked(ctx, in, src, options...)
-	if err != nil {
-		return err
+	modTime := src.ModTime(ctx)
+
+	var (
+		uploadInfo *uploadInfo
+		err        error
+	)
+
+	if src.Size() > 0 {
+		uploadInfo, err = o.uploadMultipart(ctx, bufio.NewReader(in), src)
+		if err != nil {
+			return err
+		}
 	}
 
-	// delete duplicate object after successful upload
-	err = o.Remove(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to remove old version: %w", err)
+	payload := &api.UpdateFileInformation{
+		UpdatedAt: modTime.UTC().Format(timeFormat),
+		Size:      src.Size(),
 	}
 
-	// Fetch new object after deleting the duplicate
-	info, err := o.fs.NewObject(ctx, o.Remote())
-	if err != nil {
-		return err
+	if uploadInfo != nil {
+		payload.Parts = uploadInfo.fileChunks
+		payload.UploadId = uploadInfo.uploadID
 	}
 
-	// Replace guts of old object with new one
-	*o = *info.(*Object)
+	opts := rest.Opts{
+		Method:     "PUT",
+		Path:       "/api/files/" + o.id + "/parts",
+		NoResponse: true,
+	}
+
+	err = o.fs.pacer.Call(func() (bool, error) {
+		resp, err := o.fs.srv.CallJSON(ctx, &opts, payload, nil)
+		return shouldRetry(ctx, resp, err)
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to update file information: %w", err)
+	}
+
+	o.modTime = modTime
+
+	o.size = src.Size()
 
 	return nil
 }
@@ -747,50 +638,34 @@ func (f *Fs) OpenChunkWriter(
 	src fs.ObjectInfo,
 	options ...fs.OpenOption) (info fs.ChunkWriterInfo, writer fs.ChunkWriter, err error) {
 
+	if src.Size() <= 0 {
+		return info, nil, errors.New("unknown-sized upload not supported")
+	}
+
 	o := &Object{
 		fs:     f,
 		remote: remote,
 	}
-	ui, err := o.prepareUpload(ctx, src, options)
+
+	uploadInfo, err := o.prepareUpload(ctx, src)
 
 	if err != nil {
 		return info, nil, fmt.Errorf("failed to prepare upload: %w", err)
 	}
 
-	size := src.Size()
-
-	chunkSize := int64(f.opt.ChunkSize)
-
-	totalParts := size / chunkSize
-
-	if src.Size()%chunkSize != 0 {
-		totalParts++
-	}
-
-	existingParts := make(map[int]api.PartFile, len(ui.existingChunks))
-
-	for _, part := range ui.existingChunks {
-		existingParts[part.PartNo] = part
-	}
-
 	chunkWriter := &objectChunkWriter{
-		chunkSize:     chunkSize,
-		size:          size,
-		f:             f,
-		uploadID:      ui.uploadID,
-		existingParts: existingParts,
-		src:           src,
-		o:             o,
-		totalParts:    totalParts,
-		channelID:     ui.channelID,
-		encryptFile:   ui.encryptFile,
+		size:       src.Size(),
+		f:          f,
+		src:        src,
+		o:          o,
+		uploadInfo: uploadInfo,
 	}
 	info = fs.ChunkWriterInfo{
-		ChunkSize:         int64(chunkSize),
+		ChunkSize:         uploadInfo.chunkSize,
 		Concurrency:       o.fs.opt.UploadConcurrency,
 		LeavePartsOnError: true,
 	}
-	fs.Debugf(o, "open chunk writer: started upload: %v", ui.uploadID)
+	fs.Debugf(o, "open chunk writer: started upload: %v", uploadInfo.uploadID)
 	return info, chunkWriter, err
 }
 
@@ -799,13 +674,14 @@ func (f *Fs) OpenChunkWriter(
 func (f *Fs) CreateDir(ctx context.Context, base string, leaf string) (err error) {
 
 	var resp *http.Response
-	var apiErr api.Error
 	opts := rest.Opts{
-		Method: "POST",
-		Path:   "/api/files/directories",
+		Method:     "POST",
+		Path:       "/api/files/directories",
+		NoResponse: true,
 	}
 
 	dir := base
+
 	if leaf != "" {
 		dir = path.Join(dir, leaf)
 	}
@@ -815,10 +691,10 @@ func (f *Fs) CreateDir(ctx context.Context, base string, leaf string) (err error
 	}
 
 	mkdir := api.CreateDirRequest{
-		Path: dir,
+		Path: f.opt.Enc.FromStandardPath(dir),
 	}
 	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.CallJSON(ctx, &opts, &mkdir, &apiErr)
+		resp, err = f.srv.CallJSON(ctx, &opts, &mkdir, nil)
 		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
@@ -837,15 +713,18 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) (err error) {
 	return f.CreateDir(ctx, f.root, dir)
 }
 
-// may or may not delete folders with contents?
-func (f *Fs) purge(ctx context.Context, folderID string) (err error) {
+// Rmdir removes the directory (container, bucket) if empty
+//
+// Return an error if it doesn't exist or isn't empty
+func (f *Fs) Rmdir(ctx context.Context, dir string) (err error) {
 	var resp *http.Response
 	opts := rest.Opts{
-		Method: "POST",
-		Path:   "/api/files/delete",
+		Method:     "POST",
+		Path:       "/api/files/delete",
+		NoResponse: true,
 	}
 	rm := api.RemoveFileRequest{
-		Files: []string{folderID},
+		Source: f.dirPath(dir),
 	}
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, &rm, nil)
@@ -855,17 +734,6 @@ func (f *Fs) purge(ctx context.Context, folderID string) (err error) {
 		return err
 	}
 	return nil
-}
-
-// Rmdir removes the directory (container, bucket) if empty
-//
-// Return an error if it doesn't exist or isn't empty
-func (f *Fs) Rmdir(ctx context.Context, dir string) error {
-	info, err := f.getPathInfo(ctx, f.dirPath(dir))
-	if err != nil {
-		return err
-	}
-	return f.purge(ctx, info.Files[0].Id)
 }
 
 // Move src to this remote using server-side move operations.
@@ -935,8 +803,9 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	srcPath := srcFs.dirPath(srcRemote)
 
 	opts := rest.Opts{
-		Method: "POST",
-		Path:   "/api/files/directories/move",
+		Method:     "POST",
+		Path:       "/api/files/directories/move",
+		NoResponse: true,
 	}
 	move := api.DirMove{
 		Source:      srcPath,
@@ -980,13 +849,15 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	http := o.fs.srv
 
 	fs.FixRangeOption(options, o.size)
+
+	streamType := "download"
+	if o.fs.opt.ThreadedStreams {
+		streamType = "stream"
+	}
 	opts := rest.Opts{
 		Method:  "GET",
-		Path:    fmt.Sprintf("/api/files/%s/stream/%s", o.id, url.QueryEscape(o.name)),
+		Path:    fmt.Sprintf("/api/files/%s/%s/%s", o.id, streamType, url.QueryEscape(o.name)),
 		Options: options,
-		Parameters: url.Values{
-			"hash": []string{o.fs.authHash},
-		},
 	}
 
 	err = o.fs.pacer.Call(func() (bool, error) {
@@ -1068,12 +939,11 @@ func (o *Object) Remote() string {
 // It attempts to read the objects mtime and if that isn't present the
 // LastModified returned in the http headers
 func (o *Object) ModTime(ctx context.Context) time.Time {
-	modTime, err := time.Parse(timeFormat, o.modTime)
-	if err != nil {
-		fs.Debugf(o, "Failed to read mtime from object: %v", err)
-		return time.Now()
-	}
-	return modTime
+	return o.modTime
+}
+
+func (o *Object) MimeType(ctx context.Context) string {
+	return o.mimeType
 }
 
 // Size returns the size of an object in bytes
@@ -1098,7 +968,15 @@ func (o *Object) Storable() bool {
 
 // SetModTime sets the modification time of the local fs object
 func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
-	return fs.ErrorCantSetModTime
+	updateInfo := &api.UpdateFileInformation{
+		UpdatedAt: modTime.UTC().Format(timeFormat),
+	}
+	err := o.fs.updateFileInformation(ctx, updateInfo, o.id)
+	if err != nil {
+		return fmt.Errorf("couldn't update mod time: %w", err)
+	}
+	o.modTime = modTime
+	return nil
 }
 
 // Check the interfaces are satisfied
@@ -1108,5 +986,6 @@ var (
 	_ fs.Mover           = (*Fs)(nil)
 	_ fs.DirMover        = (*Fs)(nil)
 	_ fs.Object          = (*Object)(nil)
+	_ fs.MimeTyper       = &Object{}
 	_ fs.OpenChunkWriter = (*Fs)(nil)
 )

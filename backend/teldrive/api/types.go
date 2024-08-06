@@ -1,4 +1,4 @@
-// Package api provides types used by the Uptobox API.
+// Package api provides types used by the Teldrive API.
 package api
 
 type Error struct {
@@ -33,10 +33,16 @@ type FileInfo struct {
 	ModTime  string `json:"updatedAt"`
 }
 
+type Meta struct {
+	Count       int `json:"count,omitempty"`
+	TotalPages  int `json:"totalPages,omitempty"`
+	CurrentPage int `json:"currentPage,omitempty"`
+}
+
 // ReadMetadataResponse is the response when listing folder contents
 type ReadMetadataResponse struct {
-	Files         []FileInfo `json:"results"`
-	NextPageToken string     `json:"nextPageToken,omitempty"`
+	Files []FileInfo `json:"files"`
+	Meta  Meta       `json:"meta"`
 }
 
 // UploadInfo is the response when initiating an upload
@@ -78,10 +84,8 @@ type Download struct {
 
 // MetadataRequestOptions represents all the options when listing folder contents
 type MetadataRequestOptions struct {
-	PerPage       uint64
-	SearchField   string
-	Search        string
-	NextPageToken string
+	Page  int64
+	Limit int64
 }
 
 // CreateFolderRequest is used for creating a folder
@@ -108,7 +112,7 @@ type PartFile struct {
 
 type FilePart struct {
 	ID   int    `json:"id"`
-	Salt string `json:"salt"`
+	Salt string `json:"salt,omitempty"`
 }
 
 type CreateFileRequest struct {
@@ -124,20 +128,6 @@ type CreateFileRequest struct {
 	UpdatedAt string     `json:"updatedAt,omitempty"`
 }
 
-// DeleteFolderRequest is used for deleting a folder
-type DeleteFolderRequest struct {
-	Token    string `json:"token"`
-	FolderID string `json:"fld_id"`
-}
-
-// CopyMoveFileRequest is used for moving/copying a file
-type CopyMoveFileRequest struct {
-	Token               string `json:"token"`
-	FileCodes           string `json:"file_codes"`
-	DestinationFolderID string `json:"destination_fld_id"`
-	Action              string `json:"action"`
-}
-
 // MoveFolderRequest is used for moving a folder
 type MoveFileRequest struct {
 	Files       []string `json:"files"`
@@ -150,15 +140,20 @@ type DirMove struct {
 
 // UpdateFileInformation is used for renaming a file
 type UpdateFileInformation struct {
-	Name string `json:"name"`
-	Type string `json:"type,omitempty"`
+	Name      string     `json:"name,omitempty"`
+	Type      string     `json:"type,omitempty"`
+	UpdatedAt string     `json:"updatedAt,omitempty"`
+	CreatedAt string     `json:"createdAt,omitempty"`
+	Parts     []FilePart `json:"parts,omitempty"`
+	Size      int64      `json:"size,omitempty"`
+	UploadId  string     `json:"uploadId,omitempty"`
 }
 
 // RemoveFileRequest is used for deleting a file
 type RemoveFileRequest struct {
-	Files []string `json:"files"`
+	Source string   `json:"source,omitempty"`
+	Files  []string `json:"files,omitempty"`
 }
-
 type CopyFile struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
@@ -172,5 +167,6 @@ type Token struct {
 
 type Session struct {
 	UserName string `json:"userName"`
+	UserId   int64  `json:"userId"`
 	Hash     string `json:"hash"`
 }
